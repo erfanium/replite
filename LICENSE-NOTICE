@@ -1,0 +1,8 @@
+The files under src/hrana/ (proto.rs, protobuf.rs) are adapted from the
+`libsql-hrana` crate of the tursodatabase/libsql project
+(https://github.com/tursodatabase/libsql), which is licensed under the MIT
+License and the Apache License, Version 2.0. The wire format and field
+numbers are preserved exactly for compatibility with @libsql/hrana-client.
+
+MIT License / Apache License 2.0 (choose either), copyright (c) Turso,
+ChiselStrike.
