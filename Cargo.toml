@@ -7,11 +7,16 @@ edition = "2024"
 name = "sqld"
 path = "src/main.rs"
 
+[[bin]]
+name = "binlog-inspect"
+path = "src/bin/binlog_inspect.rs"
+
 [dependencies]
 anyhow = "1.0.104"
-axum = { version = "0.8.9", features = ["macros"] }
+axum = { version = "0.8.9", features = ["macros", "json"] }
 base64 = "0.23.1"
 bytes = "1.10.1"
+futures-util = "0.3.31"
 hex = "0.4.3"
 hmac = "0.12.1"
 prost = { version = "0.14.4", features = ["derive"] }

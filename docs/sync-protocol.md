@@ -14,7 +14,7 @@ replicas. There is no conflict resolution.
 └────────────┘                    └─────────┬──────────┘
                                            │ sync endpoints
 ┌────────────┐        clone / binlog       ▼
-│  replica  │ ◀──────────────────────── (plain HTTP, JSON/binary)
+│  replica  │ ◀──────────────────────── (plain HTTP, SSE/binary)
 └────────────┘
 ```
 
@@ -29,16 +29,18 @@ loop:
       clone()                       # physical snapshot, see §4
       continue                      # then loop and start applying binlog
   else:
-      delta = GET /sync/v1/namespaces/{ns}/binlog?since=local_lsn
+      delta = GET /sync/v1/namespaces/{ns}/binlog?since=local_lsn   # SSE stream
       if delta == 409 BINLOG_LAG:   # fell behind retention window
           clone()                   # start over
           continue
-      local_lsn = apply(delta)      # logical apply, see §3
+      local_lsn = delta.x-current-lsn   # logical apply, see §3
 ```
 
 - `local_lsn` is the LSN of the last transaction applied locally (0 = empty).
-  Persist it after every successful apply (e.g. in a `sync_state` table or
-  SharedPreferences) so interrupted syncs resume exactly where they stopped.
+  After a successful apply, take it from the response's `x-current-lsn`
+  header (the stream contains every transaction up to it) and persist it
+  (e.g. in a `sync_state` table or SharedPreferences) so interrupted syncs
+  resume exactly where they stopped.
 - Applying is idempotent by construction (see §3), so a crash between "apply
   succeeded" and "persist local_lsn" is harmless — the transaction is simply
   re-applied.
@@ -72,13 +74,15 @@ keep working:
 All user routes select the namespace via the `x-namespace` request header.
 Requests without the header use the `default` namespace.
 
-## 3. Binlog format
+## 3. Binlog format (SSE)
 
 `GET /sync/v1/namespaces/{ns}/binlog?since=<lsn>` streams every committed
-transaction with `lsn > since`, in commit order. Content-Type:
-`application/x-sqlite-replication-binlog`.
+transaction with `lsn > since`, in commit order, as a **Server-Sent Events**
+response (`Content-Type: text/event-stream`). The server does not buffer the
+stream: each transaction is read from the segment files and emitted as soon
+as it is decoded.
 
-Response headers:
+Response headers (available immediately, before the first event):
 
 | Header | Meaning |
 |---|---|
@@ -86,95 +90,67 @@ Response headers:
 | `x-min-lsn` | oldest retained transaction (see §5) |
 | `x-namespace` | namespace the stream belongs to |
 
-Body: concatenated records, each record is
+One event per committed transaction:
 
 ```
-[varint32 length][Transaction protobuf message]
+id: 7
+data: {"lsn":7,"statements":["ALTER TABLE \"t\" ADD COLUMN \"extra\" INTEGER DEFAULT 0;","UPDATE \"t\" SET \"extra\" = 42 WHERE \"id\" = 1;"]}
+
 ```
 
-length = byte length of the protobuf message. Read the varint, read that many
-bytes, decode, repeat until EOF. (The server also stores segments on disk in
-this exact framing, so the wire format IS the storage format.)
+- `id:` is the transaction's LSN (also inside `data.lsn`).
+- `data:` is a single JSON object: `{"lsn": <u64>, "statements": [<sql>, ...]}`.
+- A clean EOF after the last event means the stream is complete. An empty
+  stream (nothing newer than `since`) is headers followed immediately by EOF.
+- If reading the segments fails mid-stream the server emits
+  `event: error` with `data: {"code":"BINLOG_READ","message":"..."}` and
+  then closes; clients must treat that as a failure and retry (do not
+  persist `x-current-lsn`).
+- If `since < min_lsn` the server answers **409 Conflict** with
+  `{"code":"BINLOG_LAG","message":"... re-clone ..."}` before streaming any
+  bytes (see §5).
 
-### Message definitions (protobuf)
+### Statement generation
 
-```proto
-syntax = "proto3";
+Each transaction's `statements` list is ready to apply, atomically, in
+order — the object boundary IS the transaction boundary (no BEGIN/COMMIT in
+the list):
 
-message Value {
-  oneof value {
-    Empty   null    = 1;   // Empty is a message with no fields
-    sint64  integer = 2;
-    double  float   = 3;
-    string  text    = 4;
-    bytes   blob    = 5;
-  }
-}
-message Empty {}
+1. **DDL**: the original statements, replayed verbatim (a missing trailing
+   `;` is appended).
+2. **Row changes**, materialized as statements with literal values — never
+   the original DML, which may be non-deterministic (`random()`,
+   `datetime('now')`, `DEFAULT VALUES`):
 
-enum Op { Insert = 0; Update = 1; Delete = 2; }
+   | change | generated statement |
+   |---|---|
+   | Insert | `INSERT INTO "t" ("c1",...) VALUES (...)` + `ON CONFLICT("pk") DO UPDATE SET "c1" = excluded."c1", ...` (or `DO NOTHING` when only PK columns exist) — upsert, idempotent |
+   | Update | `UPDATE "t" SET "c1" = ..., ... WHERE "pk" = ...` — PK taken from the after-image (PKs are never updated) |
+   | Delete | `DELETE FROM "t" WHERE "pk" = ...` |
 
-message RowEvent {
-  string  table        = 1;   // unquoted table name
-  Op      op           = 2;
-  repeated string  pk_columns = 3; // row identity: declared PK cols, or ["rowid"]
-  repeated Value   pk_values  = 4; // PK values (DELETE carries these; see below)
-  repeated string  columns    = 5; // after-image column names (INSERT/UPDATE)
-  repeated Value   values     = 6; // after-image values, aligned with `columns`
-}
+   `pk` is `rowid` for rowid tables without a declared PRIMARY KEY
+   (INTEGER PRIMARY KEY tables use their declared column, which equals
+   rowid).
 
-message DdlEvent {
-  repeated string statements = 1; // verbatim SQL, replay in order
-}
-
-message Transaction {
-  uint64          lsn          = 1;
-  int64           commit_ts_ms = 2;
-  repeated RowEvent rows       = 3;
-  repeated DdlEvent ddl        = 4;
-}
-```
-
-### Row event semantics (MySQL `binlog_row_image=MINIMAL`-style)
-
-| op | event content |
-|---|---|
-| `Insert` | full after-image (`columns` + `values`, including PK columns) |
-| `Update` | full after-image only — **no before-image**. Primary keys are never updated (schema contract), so an upsert reproduces the row exactly |
-| `Delete` | `pk_columns` + `pk_values` only; `columns`/`values` empty |
-
-`pk_columns` is `["rowid"]` for rowid tables without a declared PRIMARY KEY
-(INTEGER PRIMARY KEY tables use their declared column, which equals rowid).
+3. Literal encoding: `NULL`; integers as decimals; floats as the shortest
+   decimal that round-trips the exact f64, forced to a REAL literal with a
+   trailing `.0` when integral, `9e999`/`-9e999` for ±Inf, `NULL` for NaN
+   (SQLite stores NaN as NULL), `-0.0` preserved; text single-quoted with
+   `''` escaping; blobs as `X'<hex>'`. Identifiers are double-quoted,
+   embedded quotes doubled.
 
 ### Apply rules (the applier)
 
-Run in **one SQLite transaction per `Transaction` message**, with
+Run each `data` object in **one SQLite transaction**, with
 `PRAGMA foreign_keys = OFF` for the session (replicas must not have
 triggers; FK cascades are captured as explicit row events by the primary and
-would double-fire otherwise).
-
-1. **DDL**: execute each `DdlEvent.statement` verbatim (`execSQL`), in order,
-   before any row events of the same transaction.
-2. **Insert / Update** → upsert on the PK:
-
-   ```sql
-   INSERT INTO "t" ("c1","c2",...) VALUES (?, ?, ...)
-   ON CONFLICT("pk1","pk2") DO UPDATE SET
-     "c1" = excluded."c1", "c2" = excluded."c2", ...;
-   ```
-   For rowid-identified tables the conflict target is `rowid`:
-   `ON CONFLICT(rowid) DO UPDATE SET ...` (SQLite ≥ 3.24; androidx.sqlite
-   ships 3.4x).
-3. **Delete** → `DELETE FROM "t" WHERE "pk1" = ? AND "pk2" = ? ...`
-   (or `WHERE rowid = ?`).
-
-Identifier quoting: double quotes, doubling embedded quotes.
+would double-fire otherwise), then `execSQL` each statement in order.
 
 ### Idempotency
 
 Re-applying any suffix of a binlog yields the same state:
-- INSERT/UPDATE are upserts keyed by PK;
-- DELETE of a missing row is a no-op;
+- INSERT is an upsert keyed by PK;
+- UPDATE of a missing row is a no-op; DELETE of a missing row is a no-op;
 - DDL is transactional on the replica, and DDL+DML of one source transaction
   apply in one replica transaction.
 

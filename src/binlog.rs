@@ -345,26 +345,68 @@ impl Binlog {
     /// Read all transactions with lsn > `since`, in order. The caller must
     /// have already checked `since >= self.min_lsn`.
     pub fn read_since(&self, since: u64) -> Result<Vec<Transaction>> {
-        let mut out = Vec::new();
+        self.iter_since(since)?.collect()
+    }
+
+    /// Open a lazy iterator over transactions with lsn > `since`, in order.
+    /// All segment file handles are opened up-front, so a later GC deleting
+    /// segments does not invalidate the stream; records are decoded one at a
+    /// time as the caller consumes them (no full buffering).
+    ///
+    /// The caller must hold the binlog lock while calling this and have
+    /// checked `since >= self.min_lsn`.
+    pub fn iter_since(&self, since: u64) -> Result<BinlogIter> {
+        let mut files = Vec::with_capacity(self.segments.len());
         for (start_lsn, _) in &self.segments {
             let path = self.dir.join(lsn_to_name(*start_lsn));
-            let mut f = File::open(&path)?;
-            loop {
-                let len = match read_varint(&mut f)? {
-                    Some(len) => len,
-                    None => break,
-                };
-                let mut buf = vec![0u8; len as usize];
-                f.read_exact(&mut buf)
-                    .with_context(|| format!("binlog: short read in {path:?}"))?;
-                let tx = Transaction::decode(&*buf)
-                    .with_context(|| format!("binlog: corrupt record in {path:?}"))?;
-                if tx.lsn > since {
-                    out.push(tx);
+            files.push(File::open(&path)?);
+        }
+        Ok(BinlogIter {
+            files: files.into_iter(),
+            file: None,
+            since,
+        })
+    }
+}
+
+/// Lazy reader over binlog segment files: yields one decoded `Transaction`
+/// per record, skipping those with `lsn <= since`.
+pub struct BinlogIter {
+    files: std::vec::IntoIter<File>,
+    file: Option<File>,
+    since: u64,
+}
+
+impl Iterator for BinlogIter {
+    type Item = Result<Transaction>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.file.is_none() {
+                self.file = Some(self.files.next()?);
+            }
+            let file = self.file.as_mut()?;
+            let len = match read_varint(file) {
+                Ok(Some(len)) => len,
+                Ok(None) => {
+                    // clean EOF of this segment: move to the next one
+                    self.file = None;
+                    continue;
                 }
+                Err(e) => return Some(Err(e)),
+            };
+            let mut buf = vec![0u8; len as usize];
+            if let Err(e) = file.read_exact(&mut buf) {
+                return Some(Err(e.into()));
+            }
+            let tx = match Transaction::decode(&*buf) {
+                Ok(tx) => tx,
+                Err(e) => return Some(Err(e.into())),
+            };
+            if tx.lsn > self.since {
+                return Some(Ok(tx));
             }
         }
-        Ok(out)
     }
 }
 

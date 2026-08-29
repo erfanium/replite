@@ -4,7 +4,8 @@
 //! - Hrana request builders (`execute`, `seq`, `close`, `batch`).
 //! - The standalone binlog applier (`apply_binlog`) — intentionally uses
 //!   only the documented wire format, the same algorithm a mobile client
-//!   implements, with no server code.
+//!   implements, with no server code. The binlog body is plain SQL, so the
+//!   applier is just `execute_batch`.
 //! - `compare_dbs` / `assert_dbs_equal`: schema (`sqlite_master`) + row
 //!   comparison between primary and replica.
 
@@ -18,8 +19,6 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use prost::Message as _;
 use rusqlite::Connection;
-use replite::binlog::value;
-use replite::binlog::{Op, Transaction, Value as BValue};
 use replite::hrana::proto::{BatchStep, PipelineReqBody, StreamRequest};
 use replite::http::{AppState, build_router};
 use replite::namespace::NamespaceManager;
@@ -232,120 +231,75 @@ pub fn batch(steps: Vec<BatchStep>) -> StreamRequest {
 // Binlog applier (the algorithm the mobile client implements)
 // ---------------------------------------------------------------------------
 
-/// Read a varint from a byte slice; returns (value, bytes_consumed).
-pub fn read_varint(buf: &[u8]) -> (u64, usize) {
-    let mut v = 0u64;
-    let mut shift = 0u32;
-    for (i, &b) in buf.iter().enumerate() {
-        v |= ((b & 0x7f) as u64) << shift;
-        if b & 0x80 == 0 {
-            return (v, i + 1);
+/// A binlog transaction as served over SSE: an LSN plus ready-to-apply
+/// statements.
+pub struct BinlogTx {
+    /// Wire contract: verified by tests that assert LSN ordering.
+    #[allow(dead_code)]
+    pub lsn: u64,
+    pub statements: Vec<String>,
+}
+
+/// Parse an SSE binlog body (one `data:` JSON object per transaction, event
+/// `id:` = LSN) into ordered transactions. Stops at the first `event: error`.
+pub fn parse_sse(body: &[u8]) -> Vec<BinlogTx> {
+    let text = std::str::from_utf8(body).expect("binlog SSE body is not UTF-8");
+    let mut out = Vec::new();
+    let mut id = 0u64;
+    let mut data = String::new();
+    let mut event = String::new();
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("id:") {
+            id = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("event:") {
+            event = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("data:") {
+            data.push_str(v.trim());
+        } else if line.is_empty() && !data.is_empty() {
+            if event == "error" {
+                panic!("binlog stream error event: {data}");
+            }
+            let payload: serde_json::Value =
+                serde_json::from_str(&data).expect("invalid binlog event JSON");
+            let lsn = payload["lsn"].as_u64().unwrap_or(id);
+            let statements = payload["statements"]
+                .as_array()
+                .expect("binlog event missing statements")
+                .iter()
+                .map(|s| s.as_str().expect("statement is not a string").to_string())
+                .collect();
+            out.push(BinlogTx { lsn, statements });
+            data.clear();
         }
-        shift += 7;
     }
-    panic!("truncated varint")
+    out
 }
 
-/// Apply a binlog body to a fresh replica. Returns the last applied LSN.
-pub fn apply_binlog(conn: &Connection, body: &[u8]) -> u64 {
-    let mut pos = 0usize;
-    let mut last_lsn = 0u64;
-    while pos < body.len() {
-        let (len, n) = read_varint(&body[pos..]);
-        pos += n;
-        let tx = Transaction::decode(&body[pos..pos + len as usize]).unwrap();
-        pos += len as usize;
-        apply_tx(conn, &tx);
-        last_lsn = tx.lsn;
-    }
-    last_lsn
-}
-
-fn apply_tx(conn: &Connection, tx: &Transaction) {
+/// Apply a binlog body (SSE stream) to a replica connection: one transaction
+/// per event, FK constraints off (the server captured trigger effects as
+/// explicit row events; FK cascades would double-fire).
+pub fn apply_binlog(conn: &Connection, body: &[u8]) {
     conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
-
-    // DDL first, verbatim.
-    for ddl in &tx.ddl {
-        for stmt in &ddl.statements {
+    for tx in parse_sse(body) {
+        if tx.statements.is_empty() {
+            continue;
+        }
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for stmt in &tx.statements {
             conn.execute_batch(stmt)
-                .unwrap_or_else(|e| panic!("failed to apply DDL {stmt:?} for lsn {}: {e}", tx.lsn));
+                .unwrap_or_else(|e| panic!("failed to apply binlog statement: {e}\nstmt={stmt}"));
         }
-    }
-
-    // Row events, all inside one transaction (like the source transaction).
-    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    for ev in &tx.rows {
-        match Op::try_from(ev.op).unwrap() {
-            Op::Insert | Op::Update => upsert(conn, ev),
-            Op::Delete => delete(conn, ev),
-        }
-    }
-    conn.execute_batch("COMMIT").unwrap();
-}
-
-fn quote_ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
-}
-
-fn upsert(conn: &Connection, ev: &replite::binlog::RowEvent) {
-    let cols: Vec<&str> = ev.columns.iter().map(|c| c.as_str()).collect();
-    let col_list: Vec<String> = cols.iter().map(|c| quote_ident(c)).collect();
-    let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
-    let conflict: String = ev
-        .pk_columns
-        .iter()
-        .map(|c| quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let set_clause: Vec<String> = cols
-        .iter()
-        .map(|c| format!("{} = excluded.{}", quote_ident(c), quote_ident(c)))
-        .collect();
-    let sql = format!(
-        "INSERT INTO {t} ({cols}) VALUES ({ph}) \
-         ON CONFLICT({conflict}) DO UPDATE SET {set}",
-        t = quote_ident(&ev.table),
-        cols = col_list.join(", "),
-        ph = placeholders.join(", "),
-        conflict = conflict,
-        set = set_clause.join(", "),
-    );
-    let values: Vec<rusqlite::types::Value> = ev.values.iter().map(bvalue_to_owned).collect();
-    conn.execute(&sql, rusqlite::params_from_iter(values))
-        .unwrap_or_else(|e| panic!("upsert into {} failed: {e}; sql={sql}", ev.table));
-}
-
-fn delete(conn: &Connection, ev: &replite::binlog::RowEvent) {
-    let cond: Vec<String> = ev
-        .pk_columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{} = ?{}", quote_ident(c), i + 1))
-        .collect();
-    let sql = format!(
-        "DELETE FROM {t} WHERE {cond}",
-        t = quote_ident(&ev.table),
-        cond = cond.join(" AND "),
-    );
-    let values: Vec<rusqlite::types::Value> = ev.pk_values.iter().map(bvalue_to_owned).collect();
-    conn.execute(&sql, rusqlite::params_from_iter(values))
-        .unwrap();
-}
-
-fn bvalue_to_owned(v: &BValue) -> rusqlite::types::Value {
-    match &v.value {
-        Some(value::Value::Null(_)) => rusqlite::types::Value::Null,
-        Some(value::Value::Integer(i)) => rusqlite::types::Value::Integer(*i),
-        Some(value::Value::Float(f)) => rusqlite::types::Value::Real(*f),
-        Some(value::Value::Text(t)) => rusqlite::types::Value::Text(t.clone()),
-        Some(value::Value::Blob(b)) => rusqlite::types::Value::Blob(b.clone()),
-        None => rusqlite::types::Value::Null,
+        conn.execute_batch("COMMIT").unwrap();
     }
 }
 
 // ---------------------------------------------------------------------------
 // Row dump + comparison helpers
 // ---------------------------------------------------------------------------
+
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
 
 /// Dump every user table's content as sorted string rows, for comparison.
 pub fn dump_db(conn: &Connection) -> BTreeMap<String, Vec<Vec<String>>> {

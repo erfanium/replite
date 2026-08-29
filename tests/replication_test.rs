@@ -11,7 +11,6 @@ mod common;
 use axum::http::{StatusCode, header};
 use common::*;
 use prost::Message as _;
-use replite::binlog::Transaction;
 use replite::hrana::proto::{BatchStep, NamedArg, PipelineReqBody, StreamRequest, Value as HValue};
 
 use rusqlite::Connection;
@@ -51,19 +50,29 @@ async fn replication_roundtrip_json() {
         assert_eq!(status, StatusCode::OK, "failed: {sql}; body={body}");
     }
 
-    // Fetch the binlog.
+    // Fetch the binlog (an SSE stream).
     let (status, body, headers) = server.fetch_binlog(ns, 0).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+        "text/event-stream",
+        "binlog is served as SSE"
+    );
     assert_eq!(
         headers.get("x-current-lsn").unwrap().to_str().unwrap(),
         "6",
         "six transactions: 5 dml + 1 ddl (create statements)"
     );
 
-    // Apply on a fresh replica db.
+    // Apply on a fresh replica db. The body is plain SQL; the LSNs live in
+    // the response headers.
     let replica = Connection::open_in_memory().unwrap();
-    let last_lsn = apply_binlog(&replica, &body);
-    assert_eq!(last_lsn, 6);
+    apply_binlog(&replica, &body);
+    assert_eq!(
+        headers.get("x-current-lsn").unwrap().to_str().unwrap(),
+        "6",
+        "six transactions: 5 dml + 1 ddl (create statements)"
+    );
 
     // Verify the replica matches the primary.
     let primary = Connection::open(server.primary_path(ns)).unwrap();
@@ -206,10 +215,11 @@ async fn incremental_sync() {
         assert_eq!(status, StatusCode::OK);
     }
 
-    let (_, body, _) = server.fetch_binlog(ns, 0).await;
+    let (_, body, headers) = server.fetch_binlog(ns, 0).await;
     let replica = Connection::open_in_memory().unwrap();
-    let last = apply_binlog(&replica, &body);
-    assert_eq!(last, 3);
+    apply_binlog(&replica, &body);
+    let last = headers.get("x-current-lsn").unwrap().to_str().unwrap();
+    assert_eq!(last, "3");
 
     // Write more on the primary, then sync only the delta.
     for sql in [
@@ -225,10 +235,10 @@ async fn incremental_sync() {
         assert_eq!(status, StatusCode::OK);
     }
 
+    let last: u64 = last.parse().unwrap();
     let (_, body, headers) = server.fetch_binlog(ns, last).await;
     assert_eq!(headers.get("x-current-lsn").unwrap().to_str().unwrap(), "6");
-    let applied = apply_binlog(&replica, &body);
-    assert_eq!(applied, 6);
+    apply_binlog(&replica, &body);
 
     let primary = Connection::open(server.primary_path(ns)).unwrap();
     assert_dbs_equal(&primary, &replica);
@@ -293,20 +303,23 @@ async fn transactional_batch_is_single_record() {
         "batch result was an error: {body}"
     );
 
-    // The two inserts must be ONE binlog transaction with TWO row events.
+    // The two inserts must be ONE binlog transaction with TWO statements:
+    // the SSE stream carries one event per transaction, one statement per
+    // row change.
     let (_, binlog, _) = server.fetch_binlog(ns, 0).await;
-    let mut pos = 0;
-    let mut tx_count = 0;
-    let mut total_rows = 0;
-    while pos < binlog.len() {
-        let (len, n) = read_varint(&binlog[pos..]);
-        pos += n;
-        let tx = Transaction::decode(&binlog[pos..pos + len as usize]).unwrap();
-        pos += len as usize;
-        tx_count += 1;
-        total_rows += tx.rows.len();
-    }
-    assert_eq!(tx_count, 2, "DDL + one transaction");
+    let events = parse_sse(&binlog);
+    assert_eq!(events.len(), 2, "DDL + one transaction");
+    assert_eq!(events[0].lsn, 1, "DDL is the first transaction");
+    assert_eq!(events[1].lsn, 2, "the batch is the second transaction");
+    let total_rows = events
+        .iter()
+        .map(|tx| {
+            tx.statements
+                .iter()
+                .filter(|s| s.starts_with("INSERT INTO"))
+                .count()
+        })
+        .sum::<usize>();
     assert_eq!(total_rows, 2, "both inserts in one transaction");
 
     // Failed batch: BEGIN ok, INSERT violates constraint, COMMIT must be
@@ -403,10 +416,13 @@ async fn clone_snapshot() {
     };
     let (status, _) = server.pipeline_json(ns, &req).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, delta, _) = server.fetch_binlog(ns, lsn).await;
+    let (status, delta, headers) = server.fetch_binlog(ns, lsn).await;
     assert_eq!(status, StatusCode::OK);
-    let applied = apply_binlog(&replica, &delta);
-    assert_eq!(applied, 3);
+    apply_binlog(&replica, &delta);
+    assert_eq!(
+        headers.get("x-current-lsn").unwrap().to_str().unwrap(),
+        "3"
+    );
     let n: i64 = replica
         .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
         .unwrap();
